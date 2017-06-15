@@ -1,0 +1,171 @@
+LDAP CLIENT
+
+External Config:
+
+* LDAP URL
+* (Optional) Path to LDAP simple-bind password
+* Path to data store
+* Path to marker file
+* Output connection address
+* Output connection type
+* Path to auth key
+* Processes to spawn
+    0: One per CPU.
+    <0: CPU count, minus the number.
+    1: Undefined
+    2: Undefined
+    3+: Number
+
+
+MAIN PROCESS
+
+Parse LDAP URL
+If simple-bind, read password and add into URL
+
+try:
+    max_processes = len(os.sched_getaffinity(0))
+except:
+    try:
+        multiprocessing.cpu_count()
+    except:
+        max_processes = 0
+if config_max_process >= 3:
+    max_processes = config_max_processes
+if config_max_processes < 0:
+    max_processes = max_processes - config_max_processes
+
+Set mgmt_process_count = 1
+Set ldap_process_count = 1
+Set worker_process_count = max(1, max_processes - 2)
+
+If marker file does not exist
+    Delete everything under data store path
+
+Create Barrier(mgmt_process_count + ldap_process_count + worker_process_count)
+ready
+Create list of Queues
+Create Event should_shutdown
+Create Event ldap_shutdown
+Create Event worker_shutdown
+
+Fork LDAP process(barrier, ldap_shutdown, should_shutdown, list of queues, ldap_url, data_path)
+Fork worker processes(barrier, worker_shutdown, should_shutdown, queue,
+auth_key)
+
+Wait for ready Barrier
+
+If barrier is broken
+    Trigger ldap_shutdown
+    Trigger worker_shutdown
+    Join all processes
+    EXIT
+
+If marker file exists
+    Delete marker file
+
+Loop:
+    If any process is not alive
+        (Exit Loop)
+    If should_shutdown.wait(5) is True
+        (Exit Loop)
+    (Continue Loop)
+
+good_exits = 0
+
+Trigger ldap_shutdown
+Join LDAP process
+If LDAP process exitcode == 0
+    good_exits++
+
+Trigger worker_shutdown
+Join worker processes
+If worker process exitcode == 0
+    good_exits++
+
+If good_exits == (ldap_process_count + worker_process_count):
+    Create marker file
+
+EXIT
+
+
+
+LDAP PROCESS
+
+Given barrier, shutdown, should_shutdown, list of queues, ldap_url, data_path
+
+TRAP KILL
+    Trigger should_shutdown
+
+Create Syncrepl object with ldap_url and data_path
+If exception
+    Break ready Barrier
+    EXIT
+
+Wait for ready Barrier
+
+search_over = False
+queue_size = len(list_of_queues)
+
+Loop:
+
+    Loop:
+        Poll with timeout 5
+        On change:
+            Hash DN
+            Push to list_of_queues[hash % queue_size]
+        If shutdown:
+            Please stop
+        If cancelled:
+            search_over = True
+            (Exit Loop)
+        (Continue Loop)
+
+    If search_over:
+        Unbind
+        (Exit Loop)
+
+    Delete Syncrepl object
+    Create Syncrepl object
+    If exception
+        (Exit Loop)
+
+If search_over:
+    EXIT
+Else:
+    EXIT FAIL
+
+
+
+WORKER PROCESS
+
+Given barrier, shutdown, should_shutdown, in_queue, auth_key
+
+TRAP KILL
+    Trigger should_shutdown
+
+Open auth file as binary
+Create Client(address, family, auth file contents)
+If exception
+    Close auth file
+    Break ready Barrier
+    EXIT
+
+Close auth file
+Wait for ready Barrier
+
+Loop:
+    Read from in_queue with timeout
+    If exception
+        EXIT FAIL
+    Else If event
+        Process event from queue, feed entries to Client
+        If exception
+            EXIT FAIL
+    Else If timeout
+        If shutdown event
+            (Exit Loop)
+    (Continue Loop)
+
+Close Client
+
+EXIT
